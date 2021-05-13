@@ -72,14 +72,25 @@ struct vertex_t
 {
     glm::vec3 pos;
     glm::vec2 tex;
+    glm::vec3 nor;
+    glm::vec3 tan;
+    glm::vec3 bin;
     vertex_t() = default;
-    vertex_t(glm::vec3 pos, glm::vec2 tex) : pos(pos), tex(tex) { }
+    vertex_t(glm::vec3 pos, glm::vec2 tex, glm::vec3 nor, glm::vec3 tan, glm::vec3 bin) : 
+        pos(pos), tex(tex), nor(nor), tan(tan), bin(bin) { }
 };
 
 struct vertex_uniform_t
 {
     glm::mat4 model;
-    vertex_uniform_t() : model(glm::identity<glm::mat4>()) { }
+    glm::mat4 view;
+    glm::mat4 proj;
+    vertex_uniform_t() 
+    {
+        model = glm::translate(glm::vec3(0, 0, 50));
+        view = glm::identity<glm::mat4>();
+        proj = glm::perspective(glm::radians(35.f), 800.f/600.f, .1f, 100.f);
+    }
 };
 
 struct pixel_uniform_t
@@ -284,6 +295,103 @@ std::tuple<glm::uvec2, std::vector<uint8_t>> load_image(const std::string& path)
     }
 }
 
+ComPtr<ID3D12Resource> load_texture(const std::string& path, const ComPtr<ID3D12Device>& device, 
+    const ComPtr<ID3D12CommandQueue>& queue, const ComPtr<ID3D12CommandAllocator>& cmd_pool)
+{
+    auto [image_size, image_data] = load_image(path);
+    size_t image_data_size = image_size.x * image_size.y * 4;
+
+    D3D12_HEAP_PROPERTIES image_heap_props{};
+    image_heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC image_buffer_resource_desc{};
+    image_buffer_resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    image_buffer_resource_desc.Width = image_size.x;
+    image_buffer_resource_desc.Height = image_size.y;
+    image_buffer_resource_desc.DepthOrArraySize = 1;
+    image_buffer_resource_desc.MipLevels = 1;
+    image_buffer_resource_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    image_buffer_resource_desc.SampleDesc = { 1, 0 };
+    image_buffer_resource_desc.Layout = {};
+
+    ComPtr<ID3D12Resource> image_texture;
+    TRY(device->CreateCommittedResource(&image_heap_props, D3D12_HEAP_FLAG_NONE,
+        &image_buffer_resource_desc, D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr, IID_PPV_ARGS(&image_texture)));
+
+    UINT64 image_upload_size = 0;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+    device->GetCopyableFootprints(&image_buffer_resource_desc, 0, 1, 0, &footprint, nullptr, nullptr, &image_upload_size);
+
+    image_heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
+    image_buffer_resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    image_buffer_resource_desc.Width = image_upload_size;
+    image_buffer_resource_desc.Height = 1;
+    image_buffer_resource_desc.DepthOrArraySize = 1;
+    image_buffer_resource_desc.MipLevels = 1;
+    image_buffer_resource_desc.Format = DXGI_FORMAT_UNKNOWN;
+    image_buffer_resource_desc.SampleDesc = { 1, 0 };
+    image_buffer_resource_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    ComPtr<ID3D12Resource> image_buffer;
+    TRY(device->CreateCommittedResource(&image_heap_props, D3D12_HEAP_FLAG_NONE,
+        &image_buffer_resource_desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr, IID_PPV_ARGS(&image_buffer)));
+
+    if (void* ptr; SUCCEEDED(image_buffer->Map(0, nullptr, &ptr)))
+    {
+        for (UINT y = 0; y < image_size.y; y++)
+        {
+            std::copy_n(image_data.data() + y * image_size.x * 4, image_size.x * 4,
+                static_cast<uint8_t*>(ptr) + y * footprint.Footprint.RowPitch);
+        }
+        image_buffer->Unmap(0, nullptr);
+    }
+
+    ComPtr<ID3D12GraphicsCommandList> cmd_image;
+    TRY(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, cmd_pool.Get(),
+        nullptr, IID_PPV_ARGS(&cmd_image)));
+    {
+        D3D12_TEXTURE_COPY_LOCATION copy_src;
+        copy_src.pResource = image_buffer.Get();
+        copy_src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        copy_src.PlacedFootprint = footprint;
+        D3D12_TEXTURE_COPY_LOCATION copy_dst;
+        copy_dst.pResource = image_texture.Get();
+        copy_dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        copy_dst.SubresourceIndex = 0;
+        cmd_image->CopyTextureRegion(&copy_dst, 0, 0, 0, &copy_src, nullptr);
+        D3D12_RESOURCE_BARRIER barrier;
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+        barrier.Transition.pResource = image_texture.Get();
+        barrier.Transition.Subresource = 0;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        cmd_image->ResourceBarrier(1, &barrier);
+        cmd_image->Close();
+    }
+
+
+    ID3D12CommandList* image_cmd_list = cmd_image.Get();
+    queue->ExecuteCommandLists(1, &image_cmd_list);
+
+    ComPtr<ID3D12Fence> image_fence;
+    TRY(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&image_fence)));
+    debug_name(image_fence, TEXT("upload image fence"));
+
+    if (HANDLE image_upload_event = CreateEvent(nullptr, false, false, TEXT("ImageUploadEvent"));
+        SUCCEEDED(image_upload_event) &&
+        SUCCEEDED(image_fence->SetEventOnCompletion(1, image_upload_event)))
+    {
+        TRY(queue->Signal(image_fence.Get(), 1));
+        DWORD result = WaitForSingleObject(image_upload_event, INFINITE);
+        assert(result == WAIT_OBJECT_0);
+    }
+
+    image_buffer = nullptr;
+    return image_texture;
+}
+
 int main()
 {
     HWND hWnd = create_window(800, 600);
@@ -418,9 +526,12 @@ int main()
     std::vector<uint8_t> pixel_shader_bytecode = load_file("PixelShader.cso");
     std::vector<uint8_t> vertex_shader_bytecode = load_file("VertexShader.cso");
 
-    std::array<D3D12_INPUT_ELEMENT_DESC, 2> input_element_desc{
+    std::array input_element_desc{
         D3D12_INPUT_ELEMENT_DESC{ "POS", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
         D3D12_INPUT_ELEMENT_DESC{ "TEX", 0, DXGI_FORMAT_R32G32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        D3D12_INPUT_ELEMENT_DESC{ "NOR", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        D3D12_INPUT_ELEMENT_DESC{ "TAN", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        D3D12_INPUT_ELEMENT_DESC{ "BIN", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
     };
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline_desc{};
@@ -452,11 +563,11 @@ int main()
     
     vertex_uniform_t vertex_uniform;
     pixel_uniform_t pixel_uniform;
-    std::array<vertex_t, 4> quad_data{
-        vertex_t({ -0.5f, -0.5f,  0.0f }, { 0.0f, 0.0f }),
-        vertex_t({ -0.5f,  0.5f,  0.0f }, { 0.0f, 1.0f }),
-        vertex_t({  0.5f,  0.5f,  0.0f }, { 1.0f, 1.0f }),
-        vertex_t({  0.5f, -0.5f,  0.0f }, { 1.0f, 0.0f }),
+    std::array quad_data{
+        vertex_t({ -0.5f, -0.5f,  0.0f }, { 0.0f, 0.0f }, { 0, 0, -1 }, { 0, 1, 0 }, { 1, 0, 0 }),
+        vertex_t({ -0.5f,  0.5f,  0.0f }, { 0.0f, 1.0f }, { 0, 0, -1 }, { 0, 1, 0 }, { 1, 0, 0 }),
+        vertex_t({  0.5f,  0.5f,  0.0f }, { 1.0f, 1.0f }, { 0, 0, -1 }, { 0, 1, 0 }, { 1, 0, 0 }),
+        vertex_t({  0.5f, -0.5f,  0.0f }, { 1.0f, 0.0f }, { 0, 0, -1 }, { 0, 1, 0 }, { 1, 0, 0 }),
     };
     std::array<uint32_t, 6> quad_indices{ 0, 1, 2, 0, 2, 3 };
     size_t quad_vertices_size = aligned_size(quad_data, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
@@ -464,97 +575,7 @@ int main()
     size_t vertex_uniform_size = aligned_size(sizeof(vertex_uniform_t), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
     size_t pixel_uniform_size = aligned_size(sizeof(pixel_uniform_t), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
-    auto [image_size, image_data] = load_image("image.png");
-    size_t image_data_size = image_size.x * image_size.y * 4;
-
-    D3D12_HEAP_PROPERTIES image_heap_props{};
-    image_heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC image_buffer_resource_desc{};
-    image_buffer_resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    image_buffer_resource_desc.Width = image_size.x;
-    image_buffer_resource_desc.Height = image_size.y;
-    image_buffer_resource_desc.DepthOrArraySize = 1;
-    image_buffer_resource_desc.MipLevels = 1;
-    image_buffer_resource_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    image_buffer_resource_desc.SampleDesc = { 1, 0 };
-    image_buffer_resource_desc.Layout = {};
-    
-    ComPtr<ID3D12Resource> image_texture;
-    TRY(device->CreateCommittedResource(&image_heap_props, D3D12_HEAP_FLAG_NONE,
-        &image_buffer_resource_desc, D3D12_RESOURCE_STATE_COPY_DEST,
-        nullptr, IID_PPV_ARGS(&image_texture)));
-
-    UINT64 image_upload_size = 0;
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
-    device->GetCopyableFootprints(&image_buffer_resource_desc, 0, 1, 0, &footprint, nullptr, nullptr, &image_upload_size);
-
-    image_heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
-    image_buffer_resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    image_buffer_resource_desc.Width = image_upload_size;
-    image_buffer_resource_desc.Height = 1;
-    image_buffer_resource_desc.DepthOrArraySize = 1;
-    image_buffer_resource_desc.MipLevels = 1;
-    image_buffer_resource_desc.Format = DXGI_FORMAT_UNKNOWN;
-    image_buffer_resource_desc.SampleDesc = { 1, 0 };
-    image_buffer_resource_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    
-    ComPtr<ID3D12Resource> image_buffer;
-    TRY(device->CreateCommittedResource(&image_heap_props, D3D12_HEAP_FLAG_NONE,
-        &image_buffer_resource_desc, D3D12_RESOURCE_STATE_GENERIC_READ,
-        nullptr, IID_PPV_ARGS(&image_buffer)));
-
-    if (void* ptr; SUCCEEDED(image_buffer->Map(0, nullptr, &ptr)))
-    {
-        for (UINT y = 0; y < image_size.y; y++)
-        {
-            std::copy_n(image_data.data() + y * image_size.x * 4, image_size.x * 4,
-                static_cast<uint8_t*>(ptr) + y * footprint.Footprint.RowPitch);
-        }
-        image_buffer->Unmap(0, nullptr);
-    }
-
-    ComPtr<ID3D12GraphicsCommandList> cmd_image;
-    TRY(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, cmd_pool.Get(),
-        nullptr, IID_PPV_ARGS(&cmd_image)));
-    {
-        D3D12_TEXTURE_COPY_LOCATION copy_src;
-        copy_src.pResource = image_buffer.Get();
-        copy_src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        copy_src.PlacedFootprint = footprint;
-        D3D12_TEXTURE_COPY_LOCATION copy_dst;
-        copy_dst.pResource = image_texture.Get();
-        copy_dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        copy_dst.SubresourceIndex = 0;
-        cmd_image->CopyTextureRegion(&copy_dst, 0, 0, 0, &copy_src, nullptr);
-        D3D12_RESOURCE_BARRIER barrier;
-        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-        barrier.Transition.pResource = image_texture.Get();
-        barrier.Transition.Subresource = 0;
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        cmd_image->ResourceBarrier(1, &barrier);
-        cmd_image->Close();
-    }
-
-
-    ID3D12CommandList* image_cmd_list = cmd_image.Get();
-    queue->ExecuteCommandLists(1, &image_cmd_list);
-
-    ComPtr<ID3D12Fence> image_fence;
-    TRY(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&image_fence)));
-    debug_name(image_fence, TEXT("upload image fence"));
-
-    if (HANDLE image_upload_event = CreateEvent(nullptr, false, false, TEXT("ImageUploadEvent"));
-        SUCCEEDED(image_upload_event) &&
-        SUCCEEDED(image_fence->SetEventOnCompletion(1, image_upload_event)))
-    {
-        TRY(queue->Signal(image_fence.Get(), 1));
-        DWORD result = WaitForSingleObject(image_upload_event, INFINITE);
-        assert(result == WAIT_OBJECT_0);
-    }
-
-    image_buffer = nullptr;
+    ComPtr<ID3D12Resource> image_texture = load_texture("image.png", device, queue, cmd_pool);
     
     //if (void* ptr; SUCCEEDED(image_buffer->Map(0, nullptr, &ptr)))
     //{
@@ -581,30 +602,12 @@ int main()
         &buffer_resource_desc, D3D12_RESOURCE_STATE_GENERIC_READ, 
         nullptr, IID_PPV_ARGS(&buffer)));
 
-    if (void* ptr; SUCCEEDED(buffer->Map(0, nullptr, &ptr)))
+    if (uint8_t* ptr; SUCCEEDED(buffer->Map(0, nullptr, (void**)&ptr)))
     {
-        auto origin = ptr;
-        size_t space = buffer_resource_desc.Width;
-        std::align(D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
-            sizeof(vertex_t)* quad_data.size(), ptr, space);
         std::copy(quad_data.begin(), quad_data.end(), reinterpret_cast<vertex_t*>(ptr));
-        ptr = (void*)((uint8_t*)ptr + sizeof(vertex_t) * quad_data.size());
-        
-        std::align(D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
-            sizeof(uint32_t)* quad_indices.size(), ptr, space);
-        std::copy(quad_indices.begin(), quad_indices.end(), reinterpret_cast<uint32_t*>(ptr));
-        ptr = (void*)((uint8_t*)ptr + sizeof(uint32_t) * quad_indices.size());
-
-        std::align(D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
-            sizeof(vertex_uniform_t), ptr, space);
-        *reinterpret_cast<vertex_uniform_t*>(ptr) = vertex_uniform;
-        ptr = (void*)((uint8_t*)ptr + sizeof(vertex_uniform_t) * quad_indices.size());
-
-        std::align(D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
-            sizeof(vertex_uniform_t), ptr, space);
-        *reinterpret_cast<pixel_uniform_t*>(ptr) = pixel_uniform;
-        ptr = (void*)((uint8_t*)ptr + sizeof(pixel_uniform_t) * quad_indices.size());
-
+        std::copy(quad_indices.begin(), quad_indices.end(), reinterpret_cast<uint32_t*>(ptr + quad_vertices_size));
+        *reinterpret_cast<vertex_uniform_t*>(ptr + quad_vertices_size + quad_indices_size) = vertex_uniform;
+        *reinterpret_cast<pixel_uniform_t*>(ptr + quad_vertices_size + quad_indices_size + vertex_uniform_size) = pixel_uniform;
         buffer->Unmap(0, nullptr);
     }
 
